@@ -81,6 +81,8 @@ type Options struct {
 
 	MetricsCacheRefreshInterval time.Duration
 	AgentStatsRefreshInterval   time.Duration
+
+	ScimAPIKey []byte
 }
 
 // New constructs a Coder API handler.
@@ -192,6 +194,13 @@ func New(options *Options) *API {
 			w.WriteHeader(http.StatusOK)
 		})
 	})
+
+	r.Mount("/scim/v2", scimRoutes(&scimHandler{
+		log:        options.Logger,
+		db:         options.Database,
+		createUser: api.createUser,
+		scimAPIKey: options.ScimAPIKey,
+	}))
 
 	r.Route("/api/v2", func(r chi.Router) {
 		r.NotFound(func(rw http.ResponseWriter, r *http.Request) {

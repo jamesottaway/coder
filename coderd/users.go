@@ -1052,14 +1052,15 @@ type createUserRequest struct {
 func (api *API) createUser(ctx context.Context, store database.Store, req createUserRequest) (database.User, uuid.UUID, error) {
 	var user database.User
 	return user, req.OrganizationID, store.InTx(func(tx database.Store) error {
+		now := database.Now()
 		orgRoles := make([]string, 0)
 		// If no organization is provided, create a new one for the user.
 		if req.OrganizationID == uuid.Nil {
 			organization, err := tx.InsertOrganization(ctx, database.InsertOrganizationParams{
 				ID:        uuid.New(),
 				Name:      req.Username,
-				CreatedAt: database.Now(),
-				UpdatedAt: database.Now(),
+				CreatedAt: now,
+				UpdatedAt: now,
 			})
 			if err != nil {
 				return xerrors.Errorf("create organization: %w", err)
@@ -1072,8 +1073,8 @@ func (api *API) createUser(ctx context.Context, store database.Store, req create
 			ID:        uuid.New(),
 			Email:     req.Email,
 			Username:  req.Username,
-			CreatedAt: database.Now(),
-			UpdatedAt: database.Now(),
+			CreatedAt: now,
+			UpdatedAt: now,
 			// All new users are defaulted to members of the site.
 			RBACRoles: []string{},
 			LoginType: req.LoginType,
@@ -1099,8 +1100,8 @@ func (api *API) createUser(ctx context.Context, store database.Store, req create
 		}
 		_, err = tx.InsertGitSSHKey(ctx, database.InsertGitSSHKeyParams{
 			UserID:     user.ID,
-			CreatedAt:  database.Now(),
-			UpdatedAt:  database.Now(),
+			CreatedAt:  now,
+			UpdatedAt:  now,
 			PrivateKey: privateKey,
 			PublicKey:  publicKey,
 		})
@@ -1110,8 +1111,8 @@ func (api *API) createUser(ctx context.Context, store database.Store, req create
 		_, err = tx.InsertOrganizationMember(ctx, database.InsertOrganizationMemberParams{
 			OrganizationID: req.OrganizationID,
 			UserID:         user.ID,
-			CreatedAt:      database.Now(),
-			UpdatedAt:      database.Now(),
+			CreatedAt:      now,
+			UpdatedAt:      now,
 			// By default give them membership to the organization.
 			Roles: orgRoles,
 		})
