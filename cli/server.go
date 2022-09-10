@@ -369,6 +369,7 @@ func Server(newAPI func(*coderd.Options) *coderd.API) *cobra.Command {
 				AutoImportTemplates:         validatedAutoImportTemplates,
 				MetricsCacheRefreshInterval: metricsCacheRefreshInterval,
 				AgentStatsRefreshInterval:   agentStatRefreshInterval,
+				ScimAPIKey:                  []byte(scimAuthHeader),
 			}
 
 			if oauth2GithubClientSecret != "" {
