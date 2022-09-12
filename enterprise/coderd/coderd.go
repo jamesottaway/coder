@@ -41,7 +41,7 @@ func NewEnterprise(options *coderd.Options) *coderd.API {
 
 	api := coderd.New(&eOpts)
 	// the features service is added after the API is constructed because the
-	// SCIM feature requires a fully instanciated API struct.
+	// SCIM feature requires a fully instantiated API struct.
 	api.Options.FeaturesService = newFeaturesService(
 		context.Background(),
 		eOpts.Logger,
