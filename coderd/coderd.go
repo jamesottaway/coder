@@ -33,6 +33,7 @@ import (
 	"github.com/coder/coder/coderd/httpmw"
 	"github.com/coder/coder/coderd/metricscache"
 	"github.com/coder/coder/coderd/rbac"
+	"github.com/coder/coder/coderd/scim"
 	"github.com/coder/coder/coderd/telemetry"
 	"github.com/coder/coder/coderd/tracing"
 	"github.com/coder/coder/coderd/turnconn"
@@ -195,12 +196,7 @@ func New(options *Options) *API {
 		})
 	})
 
-	r.Mount("/scim/v2", scimRoutes(&scimHandler{
-		log:        options.Logger,
-		db:         options.Database,
-		createUser: api.createUser,
-		scimAPIKey: options.ScimAPIKey,
-	}))
+	r.Mount("/scim/v2", scim.Mount(options.FeaturesService))
 
 	r.Route("/api/v2", func(r chi.Router) {
 		r.NotFound(func(rw http.ResponseWriter, r *http.Request) {

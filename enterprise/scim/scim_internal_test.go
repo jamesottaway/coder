@@ -1,4 +1,4 @@
-package coderd
+package scim
 
 import (
 	"bytes"
@@ -15,21 +15,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cdr.dev/slog/sloggers/slogtest"
+	"github.com/coder/coder/coderd"
 	"github.com/coder/coder/coderd/database"
 	"github.com/coder/coder/coderd/database/databasefake"
 	"github.com/coder/coder/cryptorand"
 )
 
-func setupScimService(t *testing.T) *scimHandler {
+func setupScimService(t *testing.T) *handler {
 	t.Helper()
 
 	log := slogtest.Make(t, nil)
 	db := databasefake.New()
 
-	return &scimHandler{
+	return &handler{
 		db:  db,
 		log: log,
-		createUser: func(ctx context.Context, store database.Store, req createUserRequest) (database.User, uuid.UUID, error) {
+		createUser: func(ctx context.Context, store database.Store, req coderd.CreateUserRequest) (database.User, uuid.UUID, error) {
 			now := database.Now()
 			user, err := store.InsertUser(ctx, database.InsertUserParams{
 				ID:        uuid.New(),
@@ -74,7 +75,7 @@ func makeScimUser(t testing.TB) *scimUser {
 	}
 }
 
-func doScimRequest(ctx context.Context, t testing.TB, svc *scimHandler, fn func(w http.ResponseWriter, r *http.Request), body interface{}) *httptest.ResponseRecorder {
+func doScimRequest(ctx context.Context, t testing.TB, svc *handler, fn func(w http.ResponseWriter, r *http.Request), body interface{}) *httptest.ResponseRecorder {
 	raw, err := json.Marshal(body)
 	require.NoError(t, err)
 

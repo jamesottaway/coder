@@ -1,4 +1,4 @@
-package coderd
+package scim
 
 import (
 	"context"
@@ -14,13 +14,28 @@ import (
 	"github.com/imulab/go-scim/pkg/v2/spec"
 
 	"cdr.dev/slog"
+	"github.com/coder/coder/coderd"
 	"github.com/coder/coder/coderd/database"
 	"github.com/coder/coder/coderd/httpapi"
+	agplscim "github.com/coder/coder/coderd/scim"
 	"github.com/coder/coder/codersdk"
 )
 
-func scimRoutes(h *scimHandler) http.Handler {
+func NewHandler(
+	logger slog.Logger,
+	db database.Store,
+	createUser func(ctx context.Context, store database.Store, req coderd.CreateUserRequest) (database.User, uuid.UUID, error),
+	scimAPIKey []byte,
+) agplscim.Handler {
 	r := chi.NewRouter()
+	h := &handler{
+		Handler: r,
+
+		log:        logger,
+		db:         db,
+		createUser: createUser,
+		scimAPIKey: scimAPIKey,
+	}
 
 	r.Post("/Users", h.postUser)
 	r.Route("/Users", func(r chi.Router) {
@@ -30,19 +45,23 @@ func scimRoutes(h *scimHandler) http.Handler {
 		r.Patch("/{id}", h.patchUser)
 	})
 
-	return r
+	return h
 }
 
-type scimHandler struct {
+var _ agplscim.Handler = handler{}
+
+type handler struct {
+	http.Handler
+
 	db  database.Store
 	log slog.Logger
 
-	createUser func(ctx context.Context, store database.Store, req createUserRequest) (database.User, uuid.UUID, error)
+	createUser func(ctx context.Context, store database.Store, req coderd.CreateUserRequest) (database.User, uuid.UUID, error)
 
 	scimAPIKey []byte
 }
 
-func (s *scimHandler) verifyAuthHeader(r *http.Request) bool {
+func (s *handler) verifyAuthHeader(r *http.Request) bool {
 	hdr := []byte(r.Header.Get("Authorization"))
 
 	return len(s.scimAPIKey) != 0 && subtle.ConstantTimeCompare(hdr, s.scimAPIKey) == 1
@@ -53,7 +72,7 @@ func (s *scimHandler) verifyAuthHeader(r *http.Request) bool {
 // implement fetching users twice.
 //
 //nolint:revive
-func (s *scimHandler) getUsers(w http.ResponseWriter, r *http.Request) {
+func (s *handler) getUsers(w http.ResponseWriter, r *http.Request) {
 	if !s.verifyAuthHeader(r) {
 		_ = handlerutil.WriteError(w, spec.Error{Status: http.StatusUnauthorized, Type: "invalidAuthorization"})
 		return
@@ -72,7 +91,7 @@ func (s *scimHandler) getUsers(w http.ResponseWriter, r *http.Request) {
 // don't need to implement fetching users twice.
 //
 //nolint:revive
-func (s *scimHandler) getUser(w http.ResponseWriter, r *http.Request) {
+func (s *handler) getUser(w http.ResponseWriter, r *http.Request) {
 	if !s.verifyAuthHeader(r) {
 		_ = handlerutil.WriteError(w, spec.Error{Status: http.StatusUnauthorized, Type: "invalidAuthorization"})
 		return
@@ -107,7 +126,7 @@ type scimUser struct {
 }
 
 // postUser creates a new user, or returns the existing user if it exists.
-func (s *scimHandler) postUser(w http.ResponseWriter, r *http.Request) {
+func (s *handler) postUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if !s.verifyAuthHeader(r) {
 		_ = handlerutil.WriteError(w, spec.Error{Status: http.StatusUnauthorized, Type: "invalidAuthorization"})
@@ -134,7 +153,7 @@ func (s *scimHandler) postUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, _, err := s.createUser(ctx, s.db, createUserRequest{
+	user, _, err := s.createUser(ctx, s.db, coderd.CreateUserRequest{
 		CreateUserRequest: codersdk.CreateUserRequest{
 			Username: sUser.UserName,
 			Email:    email,
@@ -153,7 +172,7 @@ func (s *scimHandler) postUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchUser supports suspending and activating users only.
-func (s *scimHandler) patchUser(w http.ResponseWriter, r *http.Request) {
+func (s *handler) patchUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if !s.verifyAuthHeader(r) {
 		_ = handlerutil.WriteError(w, spec.Error{Status: http.StatusUnauthorized, Type: "invalidAuthorization"})
