@@ -29,6 +29,7 @@ func TestLogin(t *testing.T) {
 		badLoginURL := "https://fcca2077f06e68aaf9"
 		root, _ := clitest.New(t, "login", badLoginURL)
 		err := root.Execute()
+		// TODO@jsjoeio - have it match dial tcp error like Dean suggested
 		errMsg := fmt.Sprintf("Failed to check server %q for first user, is the URL correct and is coder accessible from your browser?", badLoginURL)
 		require.ErrorContains(t, err, errMsg)
 	})
