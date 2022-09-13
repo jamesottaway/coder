@@ -11,11 +11,12 @@ import (
 
 	"github.com/hashicorp/yamux"
 	"github.com/spf13/afero"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
-
 	"github.com/coder/coder/provisionerd/proto"
 	"github.com/coder/coder/provisionerd/runner"
 	sdkproto "github.com/coder/coder/provisionersdk/proto"
@@ -39,6 +40,7 @@ type Provisioners map[string]sdkproto.DRPCProvisionerClient
 type Options struct {
 	Filesystem afero.Fs
 	Logger     slog.Logger
+	Tracer     trace.TracerProvider
 
 	ForceCancelInterval time.Duration
 	UpdateInterval      time.Duration
@@ -61,10 +63,16 @@ func New(clientDialer Dialer, opts *Options) *Server {
 	if opts.Filesystem == nil {
 		opts.Filesystem = afero.NewOsFs()
 	}
+	if opts.Tracer == nil {
+		opts.Tracer = trace.NewNoopTracerProvider()
+	}
+
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	daemon := &Server{
+		opts:   opts,
+		tracer: opts.Tracer.Tracer("provisionerd"),
+
 		clientDialer: clientDialer,
-		opts:         opts,
 
 		closeContext: ctx,
 		closeCancel:  ctxCancel,
@@ -77,7 +85,8 @@ func New(clientDialer Dialer, opts *Options) *Server {
 }
 
 type Server struct {
-	opts *Options
+	opts   *Options
+	tracer trace.Tracer
 
 	clientDialer Dialer
 	clientValue  atomic.Value
@@ -196,26 +205,37 @@ func (p *Server) acquireJob(ctx context.Context) {
 		p.opts.Logger.Debug(context.Background(), "skipping acquire; provisionerd is shutting down...")
 		return
 	}
+
+	ctx, span := p.tracer.Start(ctx, "acquireJob")
+	defer span.End()
+
 	var err error
 	client, ok := p.client()
 	if !ok {
 		return
 	}
+
 	job, err := client.AcquireJob(ctx, &proto.Empty{})
 	if err != nil {
+		span.RecordError(err)
+
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if errors.Is(err, yamux.ErrSessionShutdown) {
 			return
 		}
-		p.opts.Logger.Warn(context.Background(), "acquire job", slog.Error(err))
+
+		span.SetStatus(codes.Error, "AcquireJob failed")
+		p.opts.Logger.Warn(ctx, "acquire job", slog.Error(err))
 		return
 	}
 	if job.JobId == "" {
+		span.AddEvent("no")
 		return
 	}
-	p.opts.Logger.Info(context.Background(), "acquired job",
+
+	p.opts.Logger.Info(ctx, "acquired job",
 		slog.F("initiator_username", job.UserName),
 		slog.F("provisioner", job.Provisioner),
 		slog.F("job_id", job.JobId),
@@ -228,13 +248,23 @@ func (p *Server) acquireJob(ctx context.Context) {
 			Error: fmt.Sprintf("no provisioner %s", job.Provisioner),
 		})
 		if err != nil {
-			p.opts.Logger.Error(context.Background(), "failed to call FailJob",
-				slog.F("job_id", job.JobId), slog.Error(err))
+			p.opts.Logger.Error(ctx, "fail job", slog.F("job_id", job.JobId), slog.Error(err))
 		}
 		return
 	}
-	p.activeJob = runner.NewRunner(job, p, p.opts.Logger, p.opts.Filesystem, p.opts.WorkDirectory, provisioner,
-		p.opts.UpdateInterval, p.opts.ForceCancelInterval)
+
+	p.activeJob = runner.NewRunner(
+		job,
+		p,
+		p.opts.Logger,
+		p.opts.Filesystem,
+		p.opts.WorkDirectory,
+		provisioner,
+		p.opts.UpdateInterval,
+		p.opts.ForceCancelInterval,
+		p.tracer,
+	)
+
 	go p.activeJob.Run()
 }
 

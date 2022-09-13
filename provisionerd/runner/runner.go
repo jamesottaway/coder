@@ -17,10 +17,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/spf13/afero"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
-
 	"github.com/coder/coder/provisionerd/proto"
 	sdkproto "github.com/coder/coder/provisionersdk/proto"
 )
@@ -30,6 +30,7 @@ const (
 )
 
 type Runner struct {
+	tracer              trace.Tracer
 	job                 *proto.AcquiredJob
 	sender              JobUpdater
 	logger              slog.Logger
@@ -40,7 +41,7 @@ type Runner struct {
 	forceCancelInterval time.Duration
 
 	// closed when the Runner is finished sending any updates/failed/complete.
-	done chan any
+	done chan struct{}
 	// active as long as we are not canceled
 	notCanceled context.Context
 	cancel      context.CancelFunc
@@ -75,7 +76,9 @@ func NewRunner(
 	workDirectory string,
 	provisioner sdkproto.DRPCProvisionerClient,
 	updateInterval time.Duration,
-	forceCancelInterval time.Duration) *Runner {
+	forceCancelInterval time.Duration,
+	tracer trace.Tracer,
+) *Runner {
 	m := new(sync.Mutex)
 
 	// we need to create our contexts here in case a call to Cancel() comes immediately.
@@ -84,6 +87,7 @@ func NewRunner(
 	gracefulContext, cancelFunc := context.WithCancel(forceStopContext)
 
 	return &Runner{
+		tracer:              tracer,
 		job:                 job,
 		sender:              updater,
 		logger:              logger,
@@ -94,7 +98,7 @@ func NewRunner(
 		forceCancelInterval: forceCancelInterval,
 		mutex:               m,
 		cond:                sync.NewCond(m),
-		done:                make(chan any),
+		done:                make(chan struct{}),
 		okToSend:            true,
 		notStopped:          forceStopContext,
 		stop:                forceStopFunc,
@@ -103,7 +107,7 @@ func NewRunner(
 	}
 }
 
-// Run the job.
+// Run executes the job.
 //
 // the idea here is to run two goroutines to work on the job: doCleanFinish and heartbeat, then use
 // the `r.cond` to wait until the job is either complete or failed.  This function then sends the
@@ -112,12 +116,12 @@ func NewRunner(
 // after attempting to gracefully cancel.  If something calls Fail(), then the failure is sent on
 // that goroutine on the context passed into Fail(), and it marks okToSend false to signal us here
 // that this function should not also send a terminal message.
-func (r *Runner) Run() {
+func (r *Runner) Run(ctx context.Context) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	defer r.stop()
 
-	go r.doCleanFinish()
+	go r.doCleanFinish(ctx)
 	go r.heartbeat()
 	for r.failedJob == nil && r.completedJob == nil {
 		r.cond.Wait()
@@ -151,7 +155,7 @@ func (r *Runner) Cancel() {
 	r.cancel()
 }
 
-func (r *Runner) Done() <-chan any {
+func (r *Runner) Done() <-chan struct{} {
 	return r.done
 }
 
@@ -227,11 +231,14 @@ func (r *Runner) update(ctx context.Context, u *proto.UpdateJobRequest) (*proto.
 }
 
 // doCleanFinish wraps a call to do() with cleaning up the job and setting the terminal messages
-func (r *Runner) doCleanFinish() {
-	// push the fail/succeed write onto the defer stack before the cleanup, so that cleanup happens
-	// before this.
-	var failedJob *proto.FailedJob
-	var completedJob *proto.CompletedJob
+func (r *Runner) doCleanFinish(ctx context.Context) {
+	var (
+		failedJob    *proto.FailedJob
+		completedJob *proto.CompletedJob
+	)
+
+	// push the fail/succeed write onto the defer stack before the cleanup, so
+	// that cleanup happens before this.
 	defer func() {
 		if failedJob != nil {
 			r.setFail(failedJob)
@@ -247,7 +254,7 @@ func (r *Runner) doCleanFinish() {
 				Source:    proto.LogSource_PROVISIONER_DAEMON,
 				Level:     sdkproto.LogLevel_INFO,
 				Stage:     "Cleaning Up",
-				CreatedAt: time.Now().UTC().UnixMilli(),
+				CreatedAt: time.Now().UnixMilli(),
 			}},
 		})
 		if err != nil {
@@ -272,11 +279,14 @@ func (r *Runner) doCleanFinish() {
 		}
 	}()
 
-	completedJob, failedJob = r.do()
+	completedJob, failedJob = r.do(ctx)
 }
 
 // do actually does the work of running the job
-func (r *Runner) do() (*proto.CompletedJob, *proto.FailedJob) {
+func (r *Runner) do(ctx context.Context) (*proto.CompletedJob, *proto.FailedJob) {
+	ctx, span := r.tracer.Start(ctx, "do")
+	defer span.End()
+
 	err := r.filesystem.MkdirAll(r.workDirectory, 0700)
 	if err != nil {
 		return nil, r.failedJobf("create work directory %q: %s", r.workDirectory, err)
@@ -288,7 +298,7 @@ func (r *Runner) do() (*proto.CompletedJob, *proto.FailedJob) {
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     "Setting up",
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 	})
 	if err != nil {
@@ -378,9 +388,10 @@ func (r *Runner) do() (*proto.CompletedJob, *proto.FailedJob) {
 
 // heartbeat periodically sends updates on the job, which keeps coder server from assuming the job
 // is stalled, and allows the runner to learn if the job has been canceled by the user.
-func (r *Runner) heartbeat() {
+func (r *Runner) heartbeat(ctx context.Context) {
 	ticker := time.NewTicker(r.updateInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-r.notCanceled.Done():
@@ -436,7 +447,7 @@ func (r *Runner) runReadmeParse() *proto.FailedJob {
 				Source:    proto.LogSource_PROVISIONER_DAEMON,
 				Level:     sdkproto.LogLevel_DEBUG,
 				Stage:     "No README.md provided",
-				CreatedAt: time.Now().UTC().UnixMilli(),
+				CreatedAt: time.Now().UnixMilli(),
 			}},
 		})
 		if err != nil {
@@ -452,7 +463,7 @@ func (r *Runner) runReadmeParse() *proto.FailedJob {
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     "Adding README.md...",
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 		Readme: fi,
 	})
@@ -470,7 +481,7 @@ func (r *Runner) runTemplateImport() (*proto.CompletedJob, *proto.FailedJob) {
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     "Parsing template parameters",
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 	})
 	if err != nil {
@@ -506,7 +517,7 @@ func (r *Runner) runTemplateImport() (*proto.CompletedJob, *proto.FailedJob) {
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     "Detecting persistent resources",
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 	})
 	if err != nil {
@@ -527,7 +538,7 @@ func (r *Runner) runTemplateImport() (*proto.CompletedJob, *proto.FailedJob) {
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     "Detecting ephemeral resources",
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 	})
 	if err != nil {
@@ -578,7 +589,7 @@ func (r *Runner) runTemplateImportParse() ([]*sdkproto.ParameterSchema, error) {
 				Logs: []*proto.Log{{
 					Source:    proto.LogSource_PROVISIONER,
 					Level:     msgType.Log.Level,
-					CreatedAt: time.Now().UTC().UnixMilli(),
+					CreatedAt: time.Now().UnixMilli(),
 					Output:    msgType.Log.Output,
 					Stage:     "Parse parameters",
 				}},
@@ -658,7 +669,7 @@ func (r *Runner) runTemplateImportProvision(values []*sdkproto.ParameterValue, m
 				Logs: []*proto.Log{{
 					Source:    proto.LogSource_PROVISIONER,
 					Level:     msgType.Log.Level,
-					CreatedAt: time.Now().UTC().UnixMilli(),
+					CreatedAt: time.Now().UnixMilli(),
 					Output:    msgType.Log.Output,
 					Stage:     stage,
 				}},
@@ -738,8 +749,7 @@ func (r *Runner) runTemplateDryRun() (
 	}, nil
 }
 
-func (r *Runner) runWorkspaceBuild() (
-	*proto.CompletedJob, *proto.FailedJob) {
+func (r *Runner) runWorkspaceBuild() (*proto.CompletedJob, *proto.FailedJob) {
 	var stage string
 	switch r.job.GetWorkspaceBuild().Metadata.WorkspaceTransition {
 	case sdkproto.WorkspaceTransition_START:
@@ -756,7 +766,7 @@ func (r *Runner) runWorkspaceBuild() (
 			Source:    proto.LogSource_PROVISIONER_DAEMON,
 			Level:     sdkproto.LogLevel_INFO,
 			Stage:     stage,
-			CreatedAt: time.Now().UTC().UnixMilli(),
+			CreatedAt: time.Now().UnixMilli(),
 		}},
 	})
 	if err != nil {
@@ -814,7 +824,7 @@ func (r *Runner) runWorkspaceBuild() (
 				Logs: []*proto.Log{{
 					Source:    proto.LogSource_PROVISIONER,
 					Level:     msgType.Log.Level,
-					CreatedAt: time.Now().UTC().UnixMilli(),
+					CreatedAt: time.Now().UnixMilli(),
 					Output:    msgType.Log.Output,
 					Stage:     stage,
 				}},
