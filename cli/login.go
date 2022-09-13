@@ -83,7 +83,7 @@ func login() *cobra.Command {
 
 			hasInitialUser, err := client.HasFirstUser(cmd.Context())
 			if err != nil {
-				return xerrors.Errorf("has initial user: %w", err)
+				return xerrors.Errorf("Failed to login to %s", serverURL.String())
 			}
 			if !hasInitialUser {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), caret+"Your Coder deployment hasn't been set up!\n")
